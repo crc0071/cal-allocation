@@ -42,6 +42,8 @@ get_levels <- function(x) {
 #' @param combo_features    参与 combo 构造的特征列名（默认除ID/cohort外全部）
 #' @param objective_features 进入目标函数 d 的特征列名（默认同上）
 #' @param protect_top       交换阶段跳过偏差最大的前 protect_top 个 set 作为 s1
+#'                          （默认 0 = 从偏差最大的 set 开始；原版 code2.R 的
+#'                          for(s1 in 10:...) 是交互会话续跑的痕迹，原意为 1）
 #' @param legacy            TRUE=复刻 code2.R 行为（对拍用）
 #' @param legacy_feature_num legacy 模式下覆盖判定使用的列数（复刻 code2.R 的
 #'                           feature_num 参数；默认=目标特征数）
@@ -57,7 +59,7 @@ get_levels <- function(x) {
 cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NULL,
                            seed = 20260813, cohort_col = "cohortID",
                            combo_features = NULL, objective_features = NULL,
-                           protect_top = 9, legacy = FALSE,
+                           protect_top = 0, legacy = FALSE,
                            legacy_feature_num = NULL,
                            swap_tol = 1e-3, max_swap_passes = 15,
                            adaptive_weight = FALSE,
