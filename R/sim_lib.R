@@ -16,7 +16,9 @@ gen_scenario <- function(scen_id, N, set_size, probs_list, cohort = NULL) {
   } else {
     # 先抽供体（供体级特征），再抽每供体的重复样本（样本级特征独立于供体）
     dprobs <- cohort$donor_probs
-    donor_n <- 0L; donor_ids <- character(0); donor_feats <- list()
+    # 注意：donor_n 不能带哨兵 0——会使 donor_ids/donor_feats 与
+    # donor_n 错位一位，最后一位供体变成 NA
+    donor_n <- integer(0); donor_ids <- character(0); donor_feats <- list()
     target <- N
     while (sum(donor_n) < target) {
       # 逐个抽供体直到达到目标样本数
@@ -31,7 +33,10 @@ gen_scenario <- function(scen_id, N, set_size, probs_list, cohort = NULL) {
     donor_n <- donor_n[1:which.max(cumsum(donor_n) >= target)]
     donor_ids <- donor_ids[seq_along(donor_n)]
     donor_feats <- donor_feats[seq_along(donor_n)]
-    data <- data.frame()
+    # 注意：不能用 data.frame()（0×0）起步再 rbind——R 会用 NA 填充
+    # 缺失列产生幽灵 NA 行；先建带列名的空数据框
+    data <- data.frame(sampleID = character(0), cohortID = character(0),
+                       stringsAsFactors = FALSE)
     for (k in seq_along(donor_ids)) {
       for (r in seq_len(donor_n[k])) {
         row <- data.frame(sampleID = sprintf("%s_V%02d", donor_ids[k], r),

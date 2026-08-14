@@ -266,6 +266,11 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
     avail <- setdiff(avail, pick)
   }
   unit_org_len <- length(unit_idx)
+  if (anyNA(grid$sample.n) || anyNA(unit_idx)) {
+    msg("[诊断] NA 出现: sample.n NA 数=", sum(is.na(grid$sample.n)),
+        " unit_idx NA 数=", sum(is.na(unit_idx)),
+        " sample.n 总计=", sum(grid$sample.n, na.rm = TRUE), "\n")
+  }
   msg("step2 comb unit 构造完成: ", unit_org_len, " 个 combo\n")
 
   # ---------- 3. 轮抽关键样本 ----------
@@ -354,8 +359,9 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
     }
   } else {
     # 回溯精确装箱（尾部小问题求解）：cohort 大小降序 + 容量降序首配
+    # 注意：sizes 由调用方按降序传入（内部不再排序，保证 sol 与调用方
+    # 的 cohort 顺序一一对齐）；caps 内部排序并映射回原位置
     pack_exact <- function(sizes, caps) {
-      sizes <- sort(sizes, decreasing = TRUE)
       ord_c <- order(caps, decreasing = TRUE)
       caps_s <- caps[ord_c]
       n_it <- length(sizes); n_c <- length(caps_s)
@@ -435,10 +441,13 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
     remaining_uids <- unique(unlist(units_per_combo, use.names = FALSE))
     if (length(remaining_uids) > 0 && length(deferred) > 0) {
       caps <- set.max.size[deferred] - set_n[deferred]
-      sol <- pack_exact(unit_n[remaining_uids], caps)
+      # cohort 按大小降序排列后再送入 pack_exact（保证 sol 对齐）
+      ord_u <- order(unit_n[remaining_uids], decreasing = TRUE)
+      uids_sorted <- remaining_uids[ord_u]
+      sol <- pack_exact(unit_n[uids_sorted], caps)
       if (!is.null(sol)) {
-        for (j in seq_along(remaining_uids)) {
-          add_unit_to_set(remaining_uids[j], deferred[sol[j]])
+        for (j in seq_along(uids_sorted)) {
+          add_unit_to_set(uids_sorted[j], deferred[sol[j]])
         }
       } else {
         # 无精确装箱（理论可能）：最小超载回退——全部放入剩余容量最大的
