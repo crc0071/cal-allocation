@@ -308,19 +308,22 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
   }
 
   # ---------- 4. 填满 ----------
-  for (si in seq_len(nset)) {
-    while (set_n[si] < set.max.size[si]) {
-      gone <- unit_idx[grid$sample.n[unit_idx] == 0]
-      if (length(gone) > 0) unit_idx <- setdiff(unit_idx, gone)
-      nc <- length(unit_idx)
-      if (nc == 0) break
-      first_u <- vapply(unit_idx, function(ci) {
-        us <- units_per_combo[[ci]]
-        if (length(us) == 0) NA_character_ else us[1]
-      }, character(1))
-      valid <- !is.na(first_u)
-      contrib <- rep(Inf, nc)
-      if (legacy) {
+  # legacy 分支逐点复刻 code2.R（对拍用，含其固有的行为细节）
+  # 论文版分支：cohort 按大小降序尝试（随机平局，减少尾部装箱失败）；
+  # 无 cohort 可装入剩余容量时该 set 暂缓；最后对暂缓 set 做回溯精确装箱
+  if (legacy) {
+    for (si in seq_len(nset)) {
+      while (set_n[si] < set.max.size[si]) {
+        gone <- unit_idx[grid$sample.n[unit_idx] == 0]
+        if (length(gone) > 0) unit_idx <- setdiff(unit_idx, gone)
+        nc <- length(unit_idx)
+        if (nc == 0) break
+        first_u <- vapply(unit_idx, function(ci) {
+          us <- units_per_combo[[ci]]
+          if (length(us) == 0) NA_character_ else us[1]
+        }, character(1))
+        valid <- !is.na(first_u)
+        contrib <- rep(Inf, nc)
         # 复刻 code2.R：trial 用该 combo 剩余行中行号最小的那一行
         for (k in seq_len(nc)) {
           if (!valid[k]) next
@@ -330,8 +333,68 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
             tabulate(match(data[[f]][ix1], obj_levels[[f]]), nbins = L[f]))
           contrib[k] <- d_counts(Map(`+`, set_cnt[[si]], extra), set_n[si] + 1)
         }
-      } else {
-        # 论文版（向量化）：trial 用每个 combo 第一个 unit 的全部行
+        o <- order(contrib)
+        finish <- FALSE
+        for (k in o) {
+          ci <- unit_idx[k]
+          if (grid$sample.n[ci] <= 0) next
+          us <- units_per_combo[[ci]]
+          if (length(us) == 0) next
+          ordr <- sample(seq_along(us), length(us))   # RNG 调用点
+          for (kk in ordr) {
+            uid <- us[kk]
+            if (is.na(unit_n[uid]) || set_n[si] + unit_n[uid] > set.max.size[si]) next
+            add_unit_to_set(uid, si)
+            finish <- TRUE
+            break
+          }
+          if (finish) break
+        }
+      }
+    }
+  } else {
+    # 回溯精确装箱（尾部小问题求解）：cohort 大小降序 + 容量降序首配
+    pack_exact <- function(sizes, caps) {
+      sizes <- sort(sizes, decreasing = TRUE)
+      ord_c <- order(caps, decreasing = TRUE)
+      caps_s <- caps[ord_c]
+      n_it <- length(sizes); n_c <- length(caps_s)
+      if (n_it == 0) return(integer(0))
+      assign <- integer(n_it)
+      rem <- caps_s
+      nodes <- 0L
+      solve <- function(i) {
+        nodes <<- nodes + 1L
+        if (nodes > 500000L) return(FALSE)   # 防组合爆炸
+        if (i > n_it) return(TRUE)
+        tried_cap <- integer(0)
+        for (b in seq_len(n_c)) {
+          if (rem[b] < sizes[i]) next
+          if (rem[b] %in% tried_cap) next    # 对称剪枝
+          tried_cap <- c(tried_cap, rem[b])
+          rem[b] <<- rem[b] - sizes[i]
+          assign[i] <<- b
+          if (solve(i + 1)) return(TRUE)
+          rem[b] <<- rem[b] + sizes[i]
+        }
+        FALSE
+      }
+      if (solve(1)) ord_c[assign] else NULL
+    }
+    deferred <- integer(0)
+    for (si in seq_len(nset)) {
+      while (set_n[si] < set.max.size[si]) {
+        gone <- unit_idx[grid$sample.n[unit_idx] == 0]
+        if (length(gone) > 0) unit_idx <- setdiff(unit_idx, gone)
+        nc <- length(unit_idx)
+        if (nc == 0) break
+        first_u <- vapply(unit_idx, function(ci) {
+          us <- units_per_combo[[ci]]
+          if (length(us) == 0) NA_character_ else us[1]
+        }, character(1))
+        valid <- !is.na(first_u)
+        contrib <- rep(Inf, nc)
+        # 向量化 trial：用每个 combo 第一个 unit 的全部行
         idx_v <- which(valid)
         n_add <- unit_n[first_u[idx_v]]
         contrib_v <- numeric(length(idx_v))
@@ -342,23 +405,47 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
             rep(p_ratio[[f]], each = length(idx_v)))) * (1 / L[f]) * w[f]
         }
         contrib[idx_v] <- contrib_v
-      }
-      o <- order(contrib)
-      finish <- FALSE
-      for (k in o) {
-        ci <- unit_idx[k]
-        if (grid$sample.n[ci] <= 0) next
-        us <- units_per_combo[[ci]]
-        if (length(us) == 0) next
-        ordr <- sample(seq_along(us), length(us))   # RNG 调用点
-        for (kk in ordr) {
-          uid <- us[kk]
-          if (is.na(unit_n[uid]) || set_n[si] + unit_n[uid] > set.max.size[si]) next
-          add_unit_to_set(uid, si)
-          finish <- TRUE
+        o <- order(contrib)
+        finish <- FALSE
+        for (k in o) {
+          ci <- unit_idx[k]
+          if (grid$sample.n[ci] <= 0) next
+          us <- units_per_combo[[ci]]
+          if (length(us) == 0) next
+          # cohort 大小降序尝试（随机平局）：大 cohort 优先离场，
+          # 避免尾部"剩余容量装不下任何 cohort"的死锁
+          ordr <- order(-unit_n[us], sample(seq_along(us)))
+          for (kk in ordr) {
+            uid <- us[kk]
+            if (is.na(unit_n[uid]) || set_n[si] + unit_n[uid] > set.max.size[si]) next
+            add_unit_to_set(uid, si)
+            finish <- TRUE
+            break
+          }
+          if (finish) break
+        }
+        if (!finish) {
+          # 无 cohort 可装入剩余容量：该 set 暂缓，先填其他 set
+          deferred <- c(deferred, si)
           break
         }
-        if (finish) break
+      }
+    }
+    # 尾部收口：剩余 cohort 精确装入暂缓 set 的剩余容量
+    remaining_uids <- unique(unlist(units_per_combo, use.names = FALSE))
+    if (length(remaining_uids) > 0 && length(deferred) > 0) {
+      caps <- set.max.size[deferred] - set_n[deferred]
+      sol <- pack_exact(unit_n[remaining_uids], caps)
+      if (!is.null(sol)) {
+        for (j in seq_along(remaining_uids)) {
+          add_unit_to_set(remaining_uids[j], deferred[sol[j]])
+        }
+      } else {
+        # 无精确装箱（理论可能）：最小超载回退——全部放入剩余容量最大的
+        # 暂缓 set，记录警告（实际数据中不应发生）
+        msg("[警告] 剩余 cohort 无法精确装箱，触发最小超载回退\n")
+        dst <- deferred[which.max(caps)]
+        for (j in seq_along(remaining_uids)) add_unit_to_set(remaining_uids[j], dst)
       }
     }
   }
