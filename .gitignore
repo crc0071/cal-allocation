@@ -1,0 +1,16 @@
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# 运行输出与日志
+*.log
+*.rds
+run_log.txt
+result/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+repo_test.R
