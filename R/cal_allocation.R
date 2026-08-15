@@ -136,42 +136,31 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
   ncomb <- nrow(grid)
   msg("step1 combo 生成完成: ", ncomb, " 个非空组合\n")
 
-  # unit 定义：legacy = (combo × cohortID) 组；论文版 = 全局 cohort（按代表行归属 combo）
-  if (legacy) {
-    if (is.null(cohort_col)) stop("legacy 模式必须有 cohort 列")
-    cids <- data[[cohort_col]]
-    units_per_combo <- vector("list", ncomb)
-    names(units_per_combo) <- rownames(grid)
-    unit_rows <- list(); unit_n <- integer(); unit_combo <- integer()
-    for (ci in seq_len(ncomb)) {
-      ix <- which(row_key == grid_key[ci])
-      # 组名排序复刻 table() 语义（保留原类型：数字按数值排序，字符按字符排序）
-      gname <- sort(unique(cids[ix]))
-      grp <- lapply(gname, function(g) ix[cids[ix] == g])
-      names(grp) <- as.character(gname)
-      ids <- paste0("L", ci, "_", as.character(gname))
-      units_per_combo[[ci]] <- ids
-      for (k in seq_along(grp)) {
-        unit_rows[[ids[k]]] <- grp[[k]]
-        unit_n[ids[k]] <- length(grp[[k]])
-        unit_combo[ids[k]] <- ci
-      }
-    }
+  # unit 定义（两种模式一致）：cohort = 同一 cohortID 且所有特征水平
+  # 完全相同的样本组（即 combo 内的 cohortID 分组）。同一供体不同访视的
+  # 样本（特征不同）是不同 unit，允许分到不同 set；特征完全相同的重复
+  # 样本（分管/技术重复）必须同 set。
+  if (is.null(cohort_col)) {
+    cids <- data[[id_col]]
   } else {
-    if (is.null(cohort_col)) {
-      cids <- data[[id_col]]
-    } else {
-      cids <- as.character(data[[cohort_col]])
+    cids <- data[[cohort_col]]
+  }
+  units_per_combo <- vector("list", ncomb)
+  names(units_per_combo) <- rownames(grid)
+  unit_rows <- list(); unit_n <- integer(); unit_combo <- integer()
+  for (ci in seq_len(ncomb)) {
+    ix <- which(row_key == grid_key[ci])
+    # 组名排序复刻 table() 语义（保留原类型：数字按数值排序，字符按字符排序）
+    gname <- sort(unique(cids[ix]))
+    grp <- lapply(gname, function(g) ix[cids[ix] == g])
+    names(grp) <- as.character(gname)
+    ids <- paste0("L", ci, "_", as.character(gname))
+    units_per_combo[[ci]] <- ids
+    for (k in seq_along(grp)) {
+      unit_rows[[ids[k]]] <- grp[[k]]
+      unit_n[ids[k]] <- length(grp[[k]])
+      unit_combo[ids[k]] <- ci
     }
-    uc <- unique(cids)
-    unit_rows <- split(seq_len(N), factor(cids, levels = uc))
-    rep_row <- vapply(unit_rows, function(ix) ix[1], integer(1))
-    rep_key <- row_key[rep_row]
-    units_per_combo <- lapply(seq_len(ncomb), function(ci) uc[rep_key == grid_key[ci]])
-    names(units_per_combo) <- rownames(grid)
-    unit_n <- vapply(unit_rows, length, integer(1))
-    unit_combo <- match(rep_key, grid_key)
-    names(unit_combo) <- names(unit_rows)
   }
   # 每个 unit 在各目标特征上的水平计数（交换优化与 d 计算的素材）
   unit_cnt <- lapply(unit_rows, function(ix)
@@ -187,12 +176,8 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
   })
   names(UM) <- objective_features
 
-  # 论文版：cohort 的行可能跨 combo（纵向样本特征不同），sample.n 改为
-  # 按 unit 行数合计，保证 sample.n 与 unit 列表始终同步；
-  # 排序仍按行数（原语义）。legacy 版保持按行计数（组内行必同 combo）
-  if (!legacy) {
-    grid$sample.n <- vapply(units_per_combo, function(us) sum(unit_n[us]), numeric(1))
-  }
+  # unit 与 combo 一一对应（组内行特征全同），行数口径的 sample.n 与
+  # unit 列表天然同步，无需重算
 
   # set 状态
   set_n <- integer(nset)
@@ -369,23 +354,39 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
       assign <- integer(n_it)
       rem <- caps_s
       nodes <- 0L
-      solve <- function(i) {
+      solve <- function(i, start_b) {
         nodes <<- nodes + 1L
-        if (nodes > 500000L) return(FALSE)   # 防组合爆炸
+        if (nodes > 5000000L) return(FALSE)   # 防组合爆炸
         if (i > n_it) return(TRUE)
+        # 相同大小的物品：后一个只允许放在前一个所选 bin 及之后（对称剪枝）
+        b0 <- if (i > 1 && sizes[i] == sizes[i - 1]) start_b else 1L
         tried_cap <- integer(0)
-        for (b in seq_len(n_c)) {
+        for (b in b0:n_c) {
           if (rem[b] < sizes[i]) next
-          if (rem[b] %in% tried_cap) next    # 对称剪枝
+          if (rem[b] %in% tried_cap) next    # 等容量 bin 剪枝
           tried_cap <- c(tried_cap, rem[b])
           rem[b] <<- rem[b] - sizes[i]
           assign[i] <<- b
-          if (solve(i + 1)) return(TRUE)
+          if (solve(i + 1, b)) return(TRUE)
           rem[b] <<- rem[b] + sizes[i]
         }
         FALSE
       }
-      if (solve(1)) ord_c[assign] else NULL
+      if (solve(1, 1L)) ord_c[assign] else NULL
+    }
+    # 最小超载回退：大件优先装入剩余容量最大的 bin；装不下时放入剩余
+    # 容量最大的 bin（唯一允许超载的途径）
+    fallback_pack <- function(sizes, caps) {
+      ord_i <- order(sizes, decreasing = TRUE)
+      assign <- integer(length(sizes))
+      rem <- caps
+      for (i in ord_i) {
+        b <- which(rem >= sizes[i])
+        bb <- if (length(b) > 0) b[which.max(rem[b])] else which.max(rem)
+        assign[i] <- bb
+        rem[bb] <- rem[bb] - sizes[i]
+      }
+      assign
     }
     deferred <- integer(0)
     for (si in seq_len(nset)) {
@@ -445,16 +446,13 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
       ord_u <- order(unit_n[remaining_uids], decreasing = TRUE)
       uids_sorted <- remaining_uids[ord_u]
       sol <- pack_exact(unit_n[uids_sorted], caps)
-      if (!is.null(sol)) {
-        for (j in seq_along(uids_sorted)) {
-          add_unit_to_set(uids_sorted[j], deferred[sol[j]])
-        }
-      } else {
-        # 无精确装箱（理论可能）：最小超载回退——全部放入剩余容量最大的
-        # 暂缓 set，记录警告（实际数据中不应发生）
-        msg("[警告] 剩余 cohort 无法精确装箱，触发最小超载回退\n")
-        dst <- deferred[which.max(caps)]
-        for (j in seq_along(remaining_uids)) add_unit_to_set(remaining_uids[j], dst)
+      if (is.null(sol)) {
+        # 节点上限内未找到精确装箱：改用最小超载分配（记录警告）
+        msg("[警告] 精确装箱未在节点上限内找到，改用最小超载分配\n")
+        sol <- fallback_pack(unit_n[uids_sorted], caps)
+      }
+      for (j in seq_along(uids_sorted)) {
+        add_unit_to_set(uids_sorted[j], deferred[sol[j]])
       }
     }
   }
