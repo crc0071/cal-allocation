@@ -53,7 +53,19 @@ get_levels <- function(x) {
 #'                          sd 改进 <0.1%，对结果无实质影响）
 #' @param adaptive_weight   自适应加权：交换阶段每轮按特征跨 set 离散度
 #'                          重算权重 w' = w × disp/mean(disp)（默认FALSE）
+#' @param objective_metric  交换阶段优化的目标（默认 "sd" = 论文原版
+#'                          sd(all_d)）："mean" = mean(all_d)，"meansq" =
+#'                          mean(all_d^2)；后两者为 2026-11-16 pilot 新增，
+#'                          仅作用于论文版路径（legacy 只支持 "sd"）
 #' @param verbose           打印进度
+#' @param subject_block     TRUE=受试者整体不可分（纵向/重复样本）；默认 FALSE。
+#'                          需要 cohort_col 指定受试者列，且第一列样本ID唯一。
+#'                          初始化时以受试者样本数为 combo，随后执行
+#'                          “一个受试者 ↔ 若干受试者”的等样本量子集互换。
+#' @param subject_block_seed 受试者子集互换阶段的随机种子；NULL 时用 seed。
+#' @param subject_block_max_iter 子集互换最大迭代次数（默认 5e6）。
+#' @param subject_block_tol  接受互换所需的最小目标改进（默认 1e-12）。
+#' @param subject_block_verbose 是否打印子集互换进度（默认跟随 verbose）。
 #' @return list(assignment=数据框(原列+key+new_set),
 #'              set_n, seed, runtime, all_sets_diff_sd, mean_d)
 cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NULL,
@@ -63,10 +75,23 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
                            legacy_feature_num = NULL,
                            swap_tol = 1e-3, max_swap_passes = 15,
                            adaptive_weight = FALSE,
-                           verbose = TRUE) {
+                           objective_metric = c("sd", "mean", "meansq"),
+                           verbose = TRUE,
+                           subject_block = FALSE,
+                           subject_block_seed = NULL,
+                           subject_block_max_iter = 5e6,
+                           subject_block_tol = 1e-12,
+                           subject_block_verbose = verbose) {
+  objective_metric <- match.arg(objective_metric)
+  if (legacy && objective_metric != "sd")
+    stop("legacy 模式只支持 objective_metric = 'sd'（对拍口径）")
   set.seed(seed)
   t0 <- Sys.time()
   msg <- function(...) if (verbose) cat(...)
+  obj_fun <- switch(objective_metric,
+                    sd     = function(d) sd(d),
+                    mean   = function(d) mean(d),
+                    meansq = function(d) mean(d^2))
 
   # ---------- 0. 输入整理 ----------
   id_col <- colnames(data)[1]
@@ -115,6 +140,174 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
     nset <- length(set.max.size)
   }
   if (sum(set.max.size) != N) stop("set.max.size 总和必须等于样本数 N")
+
+  # ---------- 0b. subject-block 模式 ----------
+  # 受试者整体不可分：同 cohort_col 的所有行必须进入同一 set。
+  # 初始化：以受试者样本数（subject_size）作为唯一 combo 特征，使同一受试者
+  # 的所有访视落在同一 combo / unit；随后执行“一个受试者 ↔ 若干受试者”的
+  # 等样本量子集互换，保持每个 set 的样本数精确不变。
+  if (subject_block) {
+    if (legacy) stop("subject_block 不支持 legacy = TRUE")
+    if (is.null(cohort_col))
+      stop("subject_block = TRUE 需要 cohort_col 指定受试者列")
+    if (anyDuplicated(data[[id_col]]))
+      stop("subject_block = TRUE 要求第一列样本ID唯一")
+
+    subj_chr <- as.character(data[[cohort_col]])
+    ssize <- as.integer(table(subj_chr)[subj_chr])
+    data_sb <- data
+    data_sb[[".subject_size"]] <- ssize
+
+    # 初始化沿用标准 Cal 填充/交换，只把 combo 特征换成 subject_size；
+    # 这样每个受试者跨访视仍是一个不可分 unit。
+    init <- cal_allocation(
+      data = data_sb, weight = weight, set_size = set_size,
+      set.max.size = set.max.size, seed = seed,
+      cohort_col = cohort_col, combo_features = ".subject_size",
+      objective_features = objective_features,
+      protect_top = protect_top, legacy = FALSE,
+      legacy_feature_num = legacy_feature_num,
+      swap_tol = swap_tol, max_swap_passes = max_swap_passes,
+      adaptive_weight = adaptive_weight,
+      objective_metric = objective_metric, verbose = verbose,
+      subject_block = FALSE
+    )
+    asg <- integer(N)
+    asg[match(init$assignment[[id_col]], data[[id_col]])] <- init$assignment$new_set
+    if (anyNA(asg)) stop("subject_block 初始化结果无法映射回输入行")
+    if (any(tapply(asg, subj_chr, function(z) length(unique(z))) > 1))
+      stop("subject_block 初始化仍拆分了受试者")
+
+    # 受试者级计数素材
+    subs <- sort(unique(subj_chr))
+    uidx <- match(subj_chr, subs)
+    usz <- as.integer(table(subj_chr)[subs])
+    nsub <- length(subs)
+    U <- lapply(objective_features, function(f) {
+      m <- matrix(0, nrow = nsub, ncol = L[f])
+      for (k in seq_len(nsub)) {
+        ix <- which(uidx == k)
+        m[k, ] <- tabulate(match(data[[f]][ix], obj_levels[[f]]), nbins = L[f])
+      }
+      m
+    })
+    names(U) <- objective_features
+    d_of <- function(cnt_list, n) {
+      sum(vapply(seq_along(cnt_list),
+                 function(f) sum(abs(cnt_list[[f]] / n - p_ratio[[f]])) *
+                   (1 / L[f]) * w[f], numeric(1)))
+    }
+
+    ss <- as.integer(tapply(asg, subj_chr, function(z) z[1])[subs])
+    set_n_sb <- as.integer(tapply(usz, ss, sum)[as.character(seq_len(nset))])
+    if (anyNA(set_n_sb) || any(set_n_sb != set.max.size))
+      stop("subject_block 初始化容量不精确")
+    members <- split(seq_along(subs), factor(ss, levels = seq_len(nset)))
+    cnt <- lapply(seq_len(nset), function(s)
+      lapply(seq_along(U), function(f) colSums(U[[f]][ss == s, , drop = FALSE])))
+    all_d <- vapply(seq_len(nset), function(s) d_of(cnt[[s]], set_n_sb[s]),
+                    numeric(1))
+    start_mean_d <- mean(all_d)
+    obj_sb <- obj_fun(all_d)
+
+    set.seed(if (is.null(subject_block_seed)) seed else subject_block_seed)
+    best <- obj_sb
+    best_ss <- ss
+    t_sb <- Sys.time()
+    n_accept <- 0L
+
+    for (it in seq_len(subject_block_max_iter)) {
+      A <- sample.int(nset, 1); B <- sample.int(nset, 1)
+      if (A == B) next
+      if (length(members[[A]]) == 0 || length(members[[B]]) == 0) next
+      i <- members[[A]][sample.int(length(members[[A]]), 1)]
+      target <- usz[i]
+      cand <- members[[B]]
+      sel <- integer(0); rem <- target
+      for (j in cand[sample(length(cand))]) {
+        if (usz[j] <= rem) { sel <- c(sel, j); rem <- rem - usz[j] }
+        if (rem == 0) break
+      }
+      if (rem != 0) next
+      if (length(sel) == 1 && sel == i) next
+
+      sumSel <- lapply(U, function(M) colSums(M[sel, , drop = FALSE]))
+      clA <- vector("list", length(U)); clB <- vector("list", length(U))
+      for (f in seq_along(U)) {
+        clA[[f]] <- cnt[[A]][[f]] - U[[f]][i, ] + sumSel[[f]]
+        clB[[f]] <- cnt[[B]][[f]] - sumSel[[f]] + U[[f]][i, ]
+      }
+      dA <- d_of(clA, set_n_sb[A]); dB <- d_of(clB, set_n_sb[B])
+
+      if (objective_metric == "mean") {
+        delta <- (dA + dB - all_d[A] - all_d[B]) / nset
+      } else if (objective_metric == "meansq") {
+        delta <- (dA^2 + dB^2 - all_d[A]^2 - all_d[B]^2) / nset
+      } else {
+        S <- sum(all_d); SS <- sum(all_d^2)
+        S2 <- S - all_d[A] - all_d[B] + dA + dB
+        SS2 <- SS - all_d[A]^2 - all_d[B]^2 + dA^2 + dB^2
+        m1 <- S / nset; m2 <- S2 / nset
+        delta <- sqrt((SS2 - nset * m2^2) / (nset - 1)) -
+                 sqrt((SS - nset * m1^2) / (nset - 1))
+      }
+
+      if (delta < -subject_block_tol) {
+        ss[i] <- B; ss[sel] <- A
+        members[[A]] <- c(setdiff(members[[A]], i), sel)
+        members[[B]] <- c(setdiff(members[[B]], sel), i)
+        cnt[[A]] <- clA; cnt[[B]] <- clB
+        all_d[A] <- dA; all_d[B] <- dB
+        obj_sb <- obj_sb + delta
+        n_accept <- n_accept + 1L
+        if (obj_sb < best) { best <- obj_sb; best_ss <- ss }
+      }
+      if (subject_block_verbose && it %% 500000 == 0)
+        cat(sprintf("subject-block iter %d obj %.8f best %.8f elapsed %.0fs\n",
+                    it, obj_sb, best,
+                    as.numeric(difftime(Sys.time(), t_sb, units = "secs"))))
+    }
+    t_sb <- as.numeric(difftime(Sys.time(), t_sb, units = "secs"))
+
+    # 用 best_ss 重算最终计数（循环结束时 cnt 对应的是当前 ss，不一定等于 best）
+    ss_final <- best_ss
+    cnt_final <- lapply(seq_len(nset), function(s)
+      lapply(seq_along(U), function(f)
+        colSums(U[[f]][ss_final == s, , drop = FALSE])))
+    final_d <- vapply(seq_len(nset), function(s)
+      d_of(cnt_final[[s]], set_n_sb[s]), numeric(1))
+    asg_final <- as.integer(ss_final[uidx])
+    tab <- tabulate(asg_final, nbins = nset)
+    if (!all(tab == set.max.size)) stop("subject_block 最终容量不精确")
+    n_split <- sum(tapply(asg_final, subj_chr,
+                          function(z) length(unique(z))) > 1)
+
+    ord <- order(asg_final, seq_len(N))
+    assignment <- data[ord, , drop = FALSE]
+    assignment$key <- 0L
+    assignment$new_set <- asg_final[ord]
+    runtime <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    msg("subject-block 完成：初始 mean_d=", round(start_mean_d, 8),
+        " 最终 mean_d=", round(mean(final_d), 8),
+        " 受试者拆分=", n_split, " 耗时=", round(runtime, 1), " 秒\n")
+    return(list(
+      assignment = assignment,
+      set_n = as.integer(tab),
+      seed = seed,
+      runtime = runtime,
+      all_sets_diff_sd = sd(final_d),
+      mean_d = mean(final_d),
+      final_d = final_d,
+      subject_block = TRUE,
+      subject_block_seed = if (is.null(subject_block_seed)) seed else subject_block_seed,
+      subject_block_iter = subject_block_max_iter,
+      subject_block_accepted = n_accept,
+      subject_block_runtime = t_sb,
+      subject_block_start_mean_d = start_mean_d,
+      n_split_subjects = n_split,
+      n_multi_subjects = sum(table(subj_chr) > 1)
+    ))
+  }
 
   # ---------- 1. combo 生成 ----------
   flist <- lapply(combo_features, function(f) levels(as.factor(data[[f]])))
@@ -539,14 +732,15 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
         wL <- w / L
         all_d <- vapply(seq_len(nset), set_d, numeric(1))
       }
-      sd_before_pass <- sd(all_d)
-      msg("step5 交换轮次 ", pass, " 当前sd=", round(sd_before_pass, 8), "\n")
+      obj_before_pass <- obj_fun(all_d)
+      msg("step5 交换轮次 ", pass, " 当前", objective_metric, "=",
+          round(obj_before_pass, 8), "\n")
       set_ord <- order(all_d, decreasing = TRUE)
       n_swaps <- 0L
       for (s1 in set_ord[s1_idx]) {
         for (s2 in rev(set_ord)) {
           if (s1 == s2) next
-          pri_sd <- sd(all_d)   # 与 code2.R 一致：每对开始时按当前状态重算
+          pri_obj <- obj_fun(all_d)   # 与 code2.R 一致：每对开始时按当前状态重算
           u1 <- set_units[[s1]]; u2 <- set_units[[s2]]
           k1 <- set_unit_key[[s1]]; k2 <- set_unit_key[[s2]]
           # 候选对：等行数且双方 key=0，按 (i,j) 嵌套序
@@ -567,11 +761,17 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
             B <- sweep(U2f, 2, set_cnt[[s2]][[f]], FUN = function(x, y) y - x) + U1f
             d2p <- d2p + rowSums(abs(B / set_n[s2] - rep(p_ratio[[f]], each = length(pi)))) * (1 / L[f]) * w[f]
           }
-          m <- (S_rest + d1p + d2p) / nset
-          tmp_sd <- sqrt((SS_rest + d1p^2 + d2p^2 - nset * m^2) / (nset - 1))
-          better <- which(tmp_sd < pri_sd)
+          tmp_obj <- if (objective_metric == "sd") {
+            m <- (S_rest + d1p + d2p) / nset
+            sqrt((SS_rest + d1p^2 + d2p^2 - nset * m^2) / (nset - 1))
+          } else if (objective_metric == "mean") {
+            (S_rest + d1p + d2p) / nset
+          } else {                      # meansq
+            (SS_rest + d1p^2 + d2p^2) / nset
+          }
+          better <- which(tmp_obj < pri_obj)
           if (length(better) == 0) next
-          b <- better[which.min(tmp_sd[better])[1]]
+          b <- better[which.min(tmp_obj[better])[1]]
           swap_units(s1, pi[b], s2, pj[b])
           n_swaps <- n_swaps + 1L
           all_d[s1] <- d1p[b]; all_d[s2] <- d2p[b]
@@ -579,7 +779,7 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
       }
       if (n_swaps == 0) break
       if (pass >= max_swap_passes) break
-      if ((sd_before_pass - sd(all_d)) < swap_tol * sd_before_pass) break
+      if ((obj_before_pass - obj_fun(all_d)) < swap_tol * abs(obj_before_pass)) break
     }
   }
   msg("step5 交换优化完成\n")

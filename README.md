@@ -21,12 +21,15 @@ large-cohort metabolomics/proteomics studies on mass spectrometry platforms.
    cohorts *within* a combination. With a fixed seed the result is
    reproducible bit-for-bit, and criterion values are highly stable across
    seeds (unlike pure shuffling methods).
-3. **Quantifiable optimality.** The exchange phase terminates at a local
-   optimum of `D` over the pairwise cohort-exchange neighbourhood: no single
-   exchange of two eligible cohorts can further decrease `D`.
-4. **Cohort integrity.** Repeated samples from the same donor/subject
-   (longitudinal visits, aliquots) are treated as one indivisible unit and
-   are always placed in the same set — a hard constraint that conventional
+3. **Local optimality under a stated neighbourhood.** The exchange phase
+   terminates when no single exchange of two eligible equal-sized cohorts can
+   further decrease the chosen objective. This is a local, neighbourhood-level
+   guarantee; global optimality is not claimed.
+4. **Cohort and subject integrity.** Samples with the same feature profile
+   and the same `cohortID` are always placed in the same set. For longitudinal
+   or repeated-measures studies, set `subject_block = TRUE` to make *all*
+   samples from the same subject indivisible across visits, even when their
+   feature profiles differ — a hard constraint that conventional
    randomization methods do not support.
 
 ## Algorithm overview
@@ -44,6 +47,11 @@ large-cohort metabolomics/proteomics studies on mass spectrometry platforms.
 5. **Exchange optimization** — pairs of sets exchange equal-sized cohorts
    whenever the global criterion `D` decreases, repeated until no improving
    exchange remains.
+6. **Optional subject blocking** — with `subject_block = TRUE`, the algorithm
+   first treats every subject as one indivisible unit (using subject size as
+   the combo feature), then refines the partition with
+   “one subject ↔ several subjects” subset exchanges that preserve each set's
+   exact sample count. The result is a hard 0-split subject constraint.
 
 ## Installation
 
@@ -59,6 +67,20 @@ result <- cal_allocation(
   seed   = 20260813             # fixed seed -> bitwise reproducible
 )
 head(result$assignment)         # original columns + key + new_set
+```
+
+For longitudinal/repeated-measures data, keep every subject in one set:
+
+```r
+result_blocked <- cal_allocation(
+  data          = my_samples,
+  weight        = list(disease = 1.0, sex = 0.5, center = 0.2, age_bin = 0.1),
+  set.max.size  = rep(35, 156),
+  cohort_col    = "cohortID",   # subject identifier
+  subject_block = TRUE,         # all visits of a subject stay together
+  seed          = 20260813
+)
+result_blocked$n_split_subjects  # must be 0
 ```
 
 Input format: a data frame whose first column is a sample identifier and
