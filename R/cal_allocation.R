@@ -51,6 +51,9 @@ get_levels <- function(x) {
 #'                          大 set 数下尾部轮次改进呈几何衰减，1e-6 过严）
 #' @param max_swap_passes   交换阶段最大轮数（默认15；实测超15轮后
 #'                          sd 改进 <0.1%，对结果无实质影响）
+#' @param allow_overshoot   TRUE=精确装箱失败时允许最小超载回退；默认 FALSE，
+#'                          此时直接报错，使“每个 set 的样本数精确等于容量”
+#'                          成为硬约束。所有已报告运行均未触发回退。
 #' @param adaptive_weight   自适应加权：交换阶段每轮按特征跨 set 离散度
 #'                          重算权重 w' = w × disp/mean(disp)（默认FALSE）
 #' @param objective_metric  交换阶段优化的目标（默认 "sd" = 论文原版
@@ -74,6 +77,7 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
                            protect_top = 0, legacy = FALSE,
                            legacy_feature_num = NULL,
                            swap_tol = 1e-3, max_swap_passes = 15,
+                           allow_overshoot = FALSE,
                            adaptive_weight = FALSE,
                            objective_metric = c("sd", "mean", "meansq"),
                            verbose = TRUE,
@@ -168,6 +172,7 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
       protect_top = protect_top, legacy = FALSE,
       legacy_feature_num = legacy_feature_num,
       swap_tol = swap_tol, max_swap_passes = max_swap_passes,
+      allow_overshoot = allow_overshoot,
       adaptive_weight = adaptive_weight,
       objective_metric = objective_metric, verbose = verbose,
       subject_block = FALSE
@@ -640,7 +645,11 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
       uids_sorted <- remaining_uids[ord_u]
       sol <- pack_exact(unit_n[uids_sorted], caps)
       if (is.null(sol)) {
-        # 节点上限内未找到精确装箱：改用最小超载分配（记录警告）
+        if (!allow_overshoot) {
+          stop("精确装箱在节点上限内未找到，且 allow_overshoot = FALSE；",
+               "请检查容量向量，或显式设置 allow_overshoot = TRUE")
+        }
+        # 显式允许时才使用最小超载分配（记录警告）
         msg("[警告] 精确装箱未在节点上限内找到，改用最小超载分配\n")
         sol <- fallback_pack(unit_n[uids_sorted], caps)
       }
@@ -648,6 +657,8 @@ cal_allocation <- function(data, weight = NULL, set_size = 35, set.max.size = NU
         add_unit_to_set(uids_sorted[j], deferred[sol[j]])
       }
     }
+    if (length(remaining_uids) > 0 && length(deferred) == 0)
+      stop("填充结束后仍有未分配 unit，且没有可用的暂缓 set")
   }
   msg("step4 填满完成\n")
 
